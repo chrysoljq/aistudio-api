@@ -1,5 +1,5 @@
 # Use Debian 12 (bookworm) explicitly so package names stay stable.
-FROM python:3.11-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
