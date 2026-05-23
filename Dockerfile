@@ -43,6 +43,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
     # Utilities
     curl \
+    x11-utils \
+    x11vnc \
+    xvfb \
     # Cleanup
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,21 +61,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY src/ src/
 COPY main.py .
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create necessary directories
 RUN mkdir -p /app/data /tmp
 
 # Set permissions
-RUN chmod +x /app/main.py
+RUN chmod +x /app/main.py /usr/local/bin/docker-entrypoint.sh
 
 # Expose ports
 # 8080: API server
+# 5900: VNC display for interactive login
 # 9222: Camoufox debug port
-EXPOSE 8080 9222
+EXPOSE 8080 5900 9222
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/v1/models || exit 1
 
 # Default command
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python3", "main.py", "server", "--port", "8080", "--camoufox-port", "9222"]
