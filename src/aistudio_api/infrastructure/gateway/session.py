@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shutil
 import threading
 import time
 import uuid
@@ -334,6 +335,22 @@ class BrowserSession:
             auth_file = fallback_auth_file
         return str(Path(auth_file).resolve().parent / "profile")
 
+    @staticmethod
+    def _cleanup_profile_singletons_sync(profile_dir: str | None) -> None:
+        if not profile_dir:
+            return
+        profile_path = Path(profile_dir)
+        if not profile_path.exists():
+            return
+        for path in profile_path.glob("Singleton*"):
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except Exception as exc:
+                log.debug("failed to remove stale Chromium singleton %s: %s", path, exc)
+
     def _bootstrap_google_session_sync(self, page) -> None:
         """Visit Google surfaces so Chromium can materialize a stable profile."""
         page.goto(GOOGLE_LOGIN_BOOTSTRAP_URL, wait_until="domcontentloaded", timeout=30000)
@@ -555,11 +572,12 @@ class BrowserSession:
         return page, url, headers
 
     def _switch_auth_sync(self, auth_file: str | None) -> None:
+        self._close_sync()
         self._auth_file = auth_file
         self._profile_dir = self._derive_profile_dir(auth_file)
         self._templates.clear()
         self._bootstrap_template = None
-        self._close_sync()
+        self._cleanup_profile_singletons_sync(self._profile_dir)
 
     def _ensure_browser_sync(self):
         if self._ctx is not None and self._hook_page is not None and not self._hook_page.is_closed():
@@ -608,10 +626,16 @@ class BrowserSession:
             # causing Google to flag the profile's cookie state as inconsistent.
             should_seed_from_auth = not (profile_path.exists() and any(profile_path.iterdir()))
             profile_path.mkdir(parents=True, exist_ok=True)
-            self._ctx = sync_launch_persistent_context(
-                profile_dir,
-                **build_browser_context_options(),
-            )
+            self._cleanup_profile_singletons_sync(profile_dir)
+            try:
+                self._ctx = sync_launch_persistent_context(
+                    profile_dir,
+                    **build_browser_context_options(),
+                )
+            except Exception:
+                self._close_sync()
+                self._cleanup_profile_singletons_sync(profile_dir)
+                raise
             self._browser = None
             self._cf = None
             self._playwright = None

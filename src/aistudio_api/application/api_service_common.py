@@ -54,27 +54,45 @@ async def try_switch_account() -> bool:
     if rotator is None:
         return False
 
-    next_account = await rotator.get_next_account()
-    if next_account is None:
-        return False
-
     account_service = runtime_state.account_service
     client = runtime_state.client
     if not all([account_service, client]):
         return False
 
-    active_account = account_service.get_active_account()
-    if active_account is not None and active_account.id == next_account.id:
-        return True
+    max_attempts = 1
+    if hasattr(rotator, "get_all_stats"):
+        try:
+            max_attempts = max(1, len(rotator.get_all_stats()))
+        except Exception:
+            max_attempts = 1
 
-    result = await account_service.activate_account(
-        next_account.id,
-        client._session,
-        runtime_state.snapshot_cache,
-        None,  # skip lock — caller already holds it
-        keep_snapshot_cache=False,
-    )
-    return result is not None
+    for _ in range(max_attempts):
+        next_account = await rotator.get_next_account()
+        if next_account is None:
+            return False
+
+        active_account = account_service.get_active_account()
+        if active_account is not None and active_account.id == next_account.id:
+            return True
+
+        try:
+            result = await account_service.activate_account(
+                next_account.id,
+                client._session,
+                runtime_state.snapshot_cache,
+                None,  # skip lock — caller already holds it
+                keep_snapshot_cache=False,
+            )
+        except Exception:
+            logger.warning("切换账号失败，跳过账号: %s", next_account.id, exc_info=True)
+            rotator.record_error(next_account.id)
+            continue
+
+        if result is not None:
+            return True
+        rotator.record_error(next_account.id)
+
+    return False
 
 
 def require_busy_lock():
