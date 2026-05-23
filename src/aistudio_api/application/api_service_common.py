@@ -63,6 +63,10 @@ async def try_switch_account() -> bool:
     if not all([account_service, client]):
         return False
 
+    active_account = account_service.get_active_account()
+    if active_account is not None and active_account.id == next_account.id:
+        return True
+
     result = await account_service.activate_account(
         next_account.id,
         client._session,
@@ -86,7 +90,7 @@ async def ensure_active_account(attempt: int) -> None:
     if attempt != 0:
         return
     account_svc = runtime_state.account_service
-    if account_svc and not account_svc.get_active_account():
+    if account_svc and runtime_state.rotator:
         await try_switch_account()
 
 

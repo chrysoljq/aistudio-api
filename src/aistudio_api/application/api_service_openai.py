@@ -327,6 +327,7 @@ def _build_streaming_response(
                             continue
                         raise
 
+                record_rotator_event("success")
                 runtime_state.record(model, "success", final_usage)
                 yield sse_chunk(chat_id, model, "", finish="tool_calls" if saw_tool_calls else "stop", include_usage=include_usage)
                 if include_usage:
@@ -334,6 +335,7 @@ def _build_streaming_response(
                 yield "data: [DONE]\n\n"
             except Exception as exc:
                 logger.error("Stream error: %s", exc, exc_info=True)
+                record_rotator_event("error")
                 runtime_state.record(model, "errors")
                 yield sse_error(str(exc))
             finally:
