@@ -43,6 +43,7 @@ async def get_rotation_status(runtime_state=Depends(get_runtime_state)):
         "mode": rotator.mode.value,
         "cooldown_seconds": rotator.cooldown_seconds,
         "sticky_seconds": settings.account_rotation_sticky_seconds,
+        "pool": runtime_state.client_pool.status() if runtime_state.client_pool else {"enabled": False, "size": 0},
         "accounts": rotator.get_all_stats(),
     }
 

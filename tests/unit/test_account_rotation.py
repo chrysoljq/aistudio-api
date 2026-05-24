@@ -1,8 +1,11 @@
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 from aistudio_api.api.state import runtime_state
+from aistudio_api.application import account_client_pool
 from aistudio_api.application import api_service_common
+from aistudio_api.application.account_client_pool import AccountClientPool
 from aistudio_api.application.account_rotator import AccountRotator, RotationMode
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 
@@ -35,6 +38,96 @@ def test_lru_prefers_never_used_accounts():
 
     assert selected is not None
     assert selected.id == "b"
+
+
+def test_least_rate_limited_tie_breaks_by_recent_use():
+    rotator = AccountRotator(
+        _Store([_account("a"), _account("b"), _account("c")]),
+        mode=RotationMode.LEAST_RATE_LIMITED,
+    )
+    rotator.record_success("a")
+
+    selected = asyncio.run(rotator.get_next_account())
+
+    assert selected is not None
+    assert selected.id == "b"
+
+
+def test_account_client_pool_skips_busy_entries(monkeypatch, tmp_path):
+    accounts = [_account("a"), _account("b"), _account("c")]
+
+    class _PoolStore(_Store):
+        def get_auth_path_optional(self, account_id, *, require_exists=False):
+            path = tmp_path / account_id / "auth.json"
+            path.parent.mkdir()
+            path.write_text("{}")
+            return path
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def warmup(self):
+            return None
+
+        async def close(self):
+            return None
+
+    store = _PoolStore(accounts)
+    rotator = AccountRotator(store, mode=RotationMode.LEAST_RATE_LIMITED)
+    monkeypatch.setattr(account_client_pool, "AIStudioClient", _FakeClient)
+    pool = AccountClientPool(account_store=store, rotator=rotator, port=9222, size=3)
+
+    async def _run():
+        async with pool.acquire() as first:
+            async with pool.acquire() as second:
+                return first.account_id, second.account_id
+
+    first_id, second_id = asyncio.run(_run())
+
+    assert first_id == "a"
+    assert second_id == "b"
+
+
+def test_record_rotator_event_uses_pooled_account_context():
+    class _Pool:
+        enabled = True
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield SimpleNamespace(account_id="pooled", client=object())
+
+    class _Rotator:
+        def __init__(self):
+            self.successes = []
+
+        def record_success(self, account_id):
+            self.successes.append(account_id)
+
+    rotator = _Rotator()
+    original = (
+        runtime_state.client_pool,
+        runtime_state.rotator,
+        runtime_state.account_service,
+    )
+    runtime_state.client_pool = _Pool()
+    runtime_state.rotator = rotator
+    runtime_state.account_service = None
+
+    async def _run():
+        async with api_service_common.request_client(object()) as leased_client:
+            assert leased_client is not None
+            api_service_common.record_rotator_event("success")
+
+    try:
+        asyncio.run(_run())
+        assert rotator.successes == ["pooled"]
+    finally:
+        (
+            runtime_state.client_pool,
+            runtime_state.rotator,
+            runtime_state.account_service,
+        ) = original
 
 
 def test_try_switch_account_skips_reactivating_current_account():

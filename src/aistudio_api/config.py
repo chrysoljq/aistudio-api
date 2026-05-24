@@ -181,6 +181,8 @@ class Settings:
     account_rotation_sticky_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_ROTATION_STICKY_SECONDS", "0"))
     account_max_retries: int = int(os.getenv("AISTUDIO_ACCOUNT_MAX_RETRIES", "3"))
     max_concurrency: int = int(os.getenv("AISTUDIO_MAX_CONCURRENCY", "3"))
+    account_pool_size: int = int(os.getenv("AISTUDIO_ACCOUNT_POOL_SIZE", "0"))
+    account_pool_warmup: bool = _load_bool_env("AISTUDIO_ACCOUNT_POOL_WARMUP", default=True)
 
     @property
     def camoufox_port(self) -> int:

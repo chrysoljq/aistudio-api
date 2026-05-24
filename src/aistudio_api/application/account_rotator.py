@@ -155,7 +155,7 @@ class AccountRotator:
         """最少限流优先。"""
         if not available:
             return None
-        return min(available, key=lambda x: x[1].rate_limited)
+        return min(available, key=lambda x: (x[1].rate_limited, x[1].last_used))
 
     async def get_next_account(self) -> AccountMeta | None:
         """获取下一个可用的账号。"""

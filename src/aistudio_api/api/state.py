@@ -18,6 +18,7 @@ class RuntimeState:
     snapshot_cache: object | None = None  # SnapshotCache 实例
     account_service: object | None = None  # AccountService 实例
     rotator: object | None = None  # AccountRotator 实例
+    client_pool: object | None = None  # AccountClientPool 实例
     anthropic_tool_context: dict[str, dict] = field(default_factory=dict)
     model_stats: dict[str, dict] = field(
         default_factory=lambda: defaultdict(

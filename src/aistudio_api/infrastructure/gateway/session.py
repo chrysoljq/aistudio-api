@@ -138,9 +138,9 @@ TEMPLATE_CAPTURE_PROMPT = "say 't'"
 
 
 class BrowserSession:
-    def __init__(self, port: int):
+    def __init__(self, port: int, auth_file: str | None = None):
         self.port = port
-        self._auth_file = settings.auth_file or self._discover_active_auth_file()
+        self._auth_file = auth_file or settings.auth_file or self._discover_active_auth_file()
         self._profile_dir = self._derive_profile_dir(self._auth_file)
         self._hook_page = None
         self._ctx = None
@@ -159,6 +159,10 @@ class BrowserSession:
 
     async def switch_auth(self, auth_file: str | None) -> None:
         await self._run_sync(self._switch_auth_sync, auth_file)
+
+    async def close(self) -> None:
+        await self._run_sync(self._close_sync)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def ensure_hook_page(self):
         await self._run_sync(self._ensure_hook_page_sync)

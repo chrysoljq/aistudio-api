@@ -45,11 +45,18 @@ class AIStudioClient:
         "1024x1536": ["2:3", "1K"],
     }
 
-    def __init__(self, port: int = DEFAULT_BROWSER_PORT):
+    def __init__(
+        self,
+        port: int = DEFAULT_BROWSER_PORT,
+        *,
+        auth_file: str | None = None,
+        snapshot_cache: SnapshotCache | None = None,
+    ):
         self.port = port
         self._captured: Optional[CapturedRequest] = None
-        self._session = BrowserSession(port=port)
-        self._capture_service = RequestCaptureService(self._session, _snapshot_cache)
+        self._snapshot_cache = snapshot_cache or _snapshot_cache
+        self._session = BrowserSession(port=port, auth_file=auth_file)
+        self._capture_service = RequestCaptureService(self._session, self._snapshot_cache)
         self._replay_service = RequestReplayService(session=self._session)
         
         self._streaming_gateway = StreamingGateway(session=self._session)
@@ -65,9 +72,14 @@ class AIStudioClient:
         if self._session is not None:
             await self._session.switch_auth(auth_file)
 
+    async def close(self) -> None:
+        """Close the underlying browser session."""
+        if self._session is not None:
+            await self._session.close()
+
     def clear_snapshot_cache(self) -> None:
         """清除 snapshot 缓存。"""
-        _snapshot_cache.clear()
+        self._snapshot_cache.clear()
 
     def _dump_raw_exchange(
         self,

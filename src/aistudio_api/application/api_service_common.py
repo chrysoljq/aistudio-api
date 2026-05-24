@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import logging
 import mimetypes
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import HTTPException
 
@@ -26,6 +28,10 @@ from aistudio_api.infrastructure.gateway.wire_types import AistudioPart
 
 logger = logging.getLogger("aistudio.server")
 MAX_RETRIES = 3
+_current_account_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "aistudio_current_account_id",
+    default=None,
+)
 
 
 def validate_image_request_options(*, size: str, n: int) -> None:
@@ -106,6 +112,35 @@ def require_busy_lock():
     return busy_lock
 
 
+def is_client_pool_enabled() -> bool:
+    pool = runtime_state.client_pool
+    return bool(pool and getattr(pool, "enabled", False))
+
+
+@asynccontextmanager
+async def request_client(default_client: AIStudioClient, attempt: int = 0) -> AsyncIterator[AIStudioClient]:
+    pool = runtime_state.client_pool
+    if pool and getattr(pool, "enabled", False):
+        async with pool.acquire() as lease:
+            token = _current_account_id.set(lease.account_id)
+            try:
+                yield lease.client
+            finally:
+                _current_account_id.reset(token)
+        return
+
+    busy_lock = require_busy_lock()
+    async with busy_lock:
+        await ensure_active_account(attempt)
+        yield default_client
+
+
+async def should_retry_rate_limit() -> bool:
+    if is_client_pool_enabled():
+        return True
+    return await try_switch_account()
+
+
 async def ensure_active_account(attempt: int) -> None:
     if attempt != 0:
         return
@@ -129,15 +164,18 @@ async def ensure_active_account(attempt: int) -> None:
 def record_rotator_event(event: str) -> None:
     rotator = runtime_state.rotator
     account_service = runtime_state.account_service
-    account = account_service.get_active_account() if account_service else None
-    if not rotator or account is None:
+    account_id = _current_account_id.get()
+    if account_id is None and account_service:
+        account = account_service.get_active_account()
+        account_id = account.id if account else None
+    if not rotator or account_id is None:
         return
     if event == "success":
-        rotator.record_success(account.id)
+        rotator.record_success(account_id)
     elif event == "rate_limited":
-        rotator.record_rate_limited(account.id)
+        rotator.record_rate_limited(account_id)
     elif event == "error":
-        rotator.record_error(account.id)
+        rotator.record_error(account_id)
 
 
 def image_response(output: Any) -> ImageGenerationResponse:
@@ -150,6 +188,11 @@ def image_response(output: Any) -> ImageGenerationResponse:
 
 def health_response() -> HealthResponse:
     busy_lock = runtime_state.busy_lock
+    pool = runtime_state.client_pool
+    if pool and getattr(pool, "enabled", False):
+        status = pool.status()
+        busy = bool(status["accounts"]) and all(account["busy"] for account in status["accounts"])
+        return HealthResponse(status="ok", busy=busy)
     return HealthResponse(status="ok", busy=busy_lock.locked() if busy_lock else False)
 
 
