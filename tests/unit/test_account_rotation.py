@@ -59,7 +59,7 @@ def test_account_client_pool_skips_busy_entries(monkeypatch, tmp_path):
     class _PoolStore(_Store):
         def get_auth_path_optional(self, account_id, *, require_exists=False):
             path = tmp_path / account_id / "auth.json"
-            path.parent.mkdir()
+            path.parent.mkdir(exist_ok=True)
             path.write_text("{}")
             return path
 
@@ -87,6 +87,39 @@ def test_account_client_pool_skips_busy_entries(monkeypatch, tmp_path):
 
     assert first_id == "a"
     assert second_id == "b"
+
+
+def test_account_client_pool_respects_explicit_account_selectors(monkeypatch, tmp_path):
+    accounts = [_account("a"), _account("b"), _account("c")]
+    accounts[1].email = "b@example.com"
+
+    class _PoolStore(_Store):
+        def get_auth_path_optional(self, account_id, *, require_exists=False):
+            path = tmp_path / account_id / "auth.json"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("{}")
+            return path
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def close(self):
+            return None
+
+    store = _PoolStore(accounts)
+    rotator = AccountRotator(store, mode=RotationMode.ROUND_ROBIN)
+    monkeypatch.setattr(account_client_pool, "AIStudioClient", _FakeClient)
+    pool = AccountClientPool(
+        account_store=store,
+        rotator=rotator,
+        port=9222,
+        size=0,
+        account_selectors=("c", "b@example.com"),
+    )
+
+    assert [account["id"] for account in pool.status()["accounts"]] == ["c", "b"]
+    assert pool.status()["configured_accounts"] == ["c", "b@example.com"]
 
 
 def test_record_rotator_event_uses_pooled_account_context():

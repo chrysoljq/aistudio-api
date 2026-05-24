@@ -44,11 +44,13 @@ class AccountClientPool:
         rotator: AccountRotator,
         port: int,
         size: int,
+        account_selectors: tuple[str, ...] = (),
     ) -> None:
         self._account_store = account_store
         self._rotator = rotator
         self._port = port
         self._configured_size = max(0, size)
+        self._account_selectors = tuple(selector.strip() for selector in account_selectors if selector.strip())
         self._entries: list[AccountClientEntry] = []
         self._entries_by_id: dict[str, AccountClientEntry] = {}
         self._select_lock = asyncio.Lock()
@@ -67,9 +69,10 @@ class AccountClientPool:
         return account_id in self._entries_by_id
 
     def _load_entries(self) -> None:
-        accounts = self._account_store.list_accounts()
+        accounts = self._select_accounts(self._account_store.list_accounts())
+        limit = self._configured_size or len(accounts)
         for account in accounts:
-            if len(self._entries) >= self._configured_size:
+            if len(self._entries) >= limit:
                 break
             auth_path = self._account_store.get_auth_path_optional(account.id, require_exists=True)
             if auth_path is None:
@@ -90,8 +93,37 @@ class AccountClientPool:
             self._entries.append(entry)
             self._entries_by_id[account.id] = entry
 
-        if self._configured_size > 0:
-            logger.info("浏览器池初始化: configured=%d, loaded=%d", self._configured_size, len(self._entries))
+        if limit > 0:
+            logger.info(
+                "浏览器池初始化: configured=%d, selected=%d, loaded=%d",
+                limit,
+                len(accounts),
+                len(self._entries),
+            )
+
+    def _select_accounts(self, accounts: list[AccountMeta]) -> list[AccountMeta]:
+        if not self._account_selectors:
+            return accounts
+
+        by_key: dict[str, AccountMeta] = {}
+        for account in accounts:
+            by_key[account.id] = account
+            by_key[account.name.lower()] = account
+            if account.email:
+                by_key[account.email.lower()] = account
+
+        selected: list[AccountMeta] = []
+        seen: set[str] = set()
+        for selector in self._account_selectors:
+            account = by_key.get(selector) or by_key.get(selector.lower())
+            if account is None:
+                logger.warning("浏览器池配置的账号不存在，跳过: %s", selector)
+                continue
+            if account.id in seen:
+                continue
+            selected.append(account)
+            seen.add(account.id)
+        return selected
 
     async def warmup(self) -> None:
         async def _warm_entry(entry: AccountClientEntry) -> None:
@@ -185,6 +217,7 @@ class AccountClientPool:
         return {
             "enabled": self.enabled,
             "configured_size": self._configured_size,
+            "configured_accounts": list(self._account_selectors),
             "size": len(self._entries),
             "accounts": [
                 {

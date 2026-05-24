@@ -64,12 +64,13 @@ async def lifespan(app: FastAPI):
     runtime_state.rotator = rotator
 
     client_pool = None
-    if settings.account_pool_size > 0:
+    if settings.account_pool_size > 0 or settings.account_pool_accounts:
         client_pool = AccountClientPool(
             account_store=account_store,
             rotator=rotator,
             port=runtime_state.browser_port,
             size=settings.account_pool_size,
+            account_selectors=settings.account_pool_accounts,
         )
         if client_pool.enabled:
             runtime_state.client_pool = client_pool
