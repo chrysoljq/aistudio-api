@@ -6,10 +6,12 @@ import base64
 import logging
 import mimetypes
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
 
+from aistudio_api.config import settings
 from aistudio_api.api.response_models import (
     HealthResponse,
     ImageGenerationResponse,
@@ -109,6 +111,18 @@ async def ensure_active_account(attempt: int) -> None:
         return
     account_svc = runtime_state.account_service
     if account_svc and runtime_state.rotator:
+        active_account = account_svc.get_active_account()
+        sticky_seconds = settings.account_rotation_sticky_seconds
+        if active_account is not None and sticky_seconds > 0 and active_account.last_used:
+            try:
+                last_switch = datetime.fromisoformat(active_account.last_used)
+                if last_switch.tzinfo is None:
+                    last_switch = last_switch.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - last_switch.astimezone(timezone.utc)).total_seconds()
+                if age < sticky_seconds:
+                    return
+            except ValueError:
+                pass
         await try_switch_account()
 
 

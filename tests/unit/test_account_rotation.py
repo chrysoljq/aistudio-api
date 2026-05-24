@@ -174,3 +174,49 @@ def test_ensure_active_account_uses_rotator_even_when_account_is_active():
             runtime_state.client,
             runtime_state.snapshot_cache,
         ) = original
+
+
+def test_ensure_active_account_respects_sticky_window(monkeypatch):
+    active = _account("a")
+    active.last_used = "2026-01-01T00:00:00+00:00"
+
+    class _Rotator:
+        async def get_next_account(self):
+            raise AssertionError("sticky active account should skip rotation")
+
+    class _AccountService:
+        def get_active_account(self):
+            return active
+
+    class _FixedDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 0, 0, 10, tzinfo=timezone.utc)
+
+        @staticmethod
+        def fromisoformat(value):
+            return datetime.fromisoformat(value)
+
+    from datetime import datetime, timezone
+
+    original = (
+        runtime_state.rotator,
+        runtime_state.account_service,
+        runtime_state.client,
+        runtime_state.snapshot_cache,
+    )
+    monkeypatch.setattr(api_service_common.settings, "account_rotation_sticky_seconds", 60)
+    monkeypatch.setattr(api_service_common, "datetime", _FixedDatetime)
+    runtime_state.rotator = _Rotator()
+    runtime_state.account_service = _AccountService()
+    runtime_state.client = SimpleNamespace(_session=object())
+    runtime_state.snapshot_cache = object()
+    try:
+        asyncio.run(api_service_common.ensure_active_account(0))
+    finally:
+        (
+            runtime_state.rotator,
+            runtime_state.account_service,
+            runtime_state.client,
+            runtime_state.snapshot_cache,
+        ) = original

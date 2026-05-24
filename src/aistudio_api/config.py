@@ -178,6 +178,7 @@ class Settings:
     # 账号轮询配置
     account_rotation_mode: str = os.getenv("AISTUDIO_ACCOUNT_ROTATION_MODE", "round_robin")  # round_robin, lru, least_rl
     account_cooldown_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_COOLDOWN_SECONDS", "60"))
+    account_rotation_sticky_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_ROTATION_STICKY_SECONDS", "0"))
     account_max_retries: int = int(os.getenv("AISTUDIO_ACCOUNT_MAX_RETRIES", "3"))
     max_concurrency: int = int(os.getenv("AISTUDIO_MAX_CONCURRENCY", "3"))
 
