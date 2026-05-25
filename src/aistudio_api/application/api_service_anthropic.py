@@ -23,11 +23,10 @@ from aistudio_api.api.schemas import AnthropicMessageRequest
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.api_service_common import (
     MAX_RETRIES,
-    ensure_active_account,
     logger,
     record_rotator_event,
-    require_busy_lock,
-    try_switch_account,
+    request_client,
+    should_retry_rate_limit,
 )
 from aistudio_api.application.chat_service import cleanup_files, normalize_anthropic_request
 from aistudio_api.domain.errors import AistudioError, AuthError, RequestError, UsageLimitExceeded
@@ -165,8 +164,6 @@ def _prepare_anthropic_function_calls(function_calls: list[dict] | None) -> list
 
 
 async def handle_anthropic_messages(req: AnthropicMessageRequest, client: AIStudioClient):
-    busy_lock = require_busy_lock()
-
     normalized = normalize_anthropic_request(req, tool_context=runtime_state.anthropic_tool_context)
     model = normalized["model"]
     cleanup_paths = list(normalized["cleanup_paths"])
@@ -183,8 +180,7 @@ async def handle_anthropic_messages(req: AnthropicMessageRequest, client: AIStud
     last_error = None
     try:
         for attempt in range(MAX_RETRIES):
-            async with busy_lock:
-                await ensure_active_account(attempt)
+            async with request_client(client, attempt) as active_client:
                 try:
                     logger.info(
                         "Anthropic messages: model=%s, contents=%s, capture_prompt=%s..., stream=%s, attempt=%d",
@@ -194,7 +190,7 @@ async def handle_anthropic_messages(req: AnthropicMessageRequest, client: AIStud
                         req.stream,
                         attempt + 1,
                     )
-                    output = await client.generate_content(
+                    output = await active_client.generate_content(
                         model=model,
                         capture_prompt=normalized["capture_prompt"],
                         capture_images=normalized["capture_images"],
@@ -229,8 +225,8 @@ async def handle_anthropic_messages(req: AnthropicMessageRequest, client: AIStud
                     runtime_state.record(model, "rate_limited")
                     last_error = exc
                     record_rotator_event("rate_limited")
-                    if await try_switch_account():
-                        logger.info("Anthropic 429 限流，已切换账号，重试 %d/%d", attempt + 1, MAX_RETRIES)
+                    if await should_retry_rate_limit():
+                        logger.info("Anthropic 429 限流，重试 %d/%d", attempt + 1, MAX_RETRIES)
                         continue
                     raise HTTPException(429, detail={"message": str(exc), "type": "rate_limit_error"}) from exc
                 except AistudioError as exc:
@@ -255,45 +251,39 @@ def _build_anthropic_streaming_response(
     tool_names: set[str],
 ) -> StreamingResponse:
     async def stream_response():
-        busy_lock = runtime_state.busy_lock
         model = normalized["model"]
-        if busy_lock is None:
-            yield anthropic_error_sse("Server not ready")
-            cleanup_files(cleanup_paths)
-            return
+        try:
+            message_id = new_message_id()
+            content_block_index = 0
+            text_block_started = False
+            text_block_index = 0
+            final_usage = None
+            saw_tool_use = False
+            thinking_fragments: list[str] = []
+            latest_thought_signature = ""
 
-        async with busy_lock:
-            try:
-                message_id = new_message_id()
-                content_block_index = 0
-                text_block_started = False
-                text_block_index = 0
-                final_usage = None
-                saw_tool_use = False
-                thinking_fragments: list[str] = []
-                latest_thought_signature = ""
-
-                yield anthropic_sse(
-                    "message_start",
-                    {
-                        "type": "message_start",
-                        "message": {
-                            "id": message_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "model": model,
-                            "content": [],
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0},
-                        },
+            yield anthropic_sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
                     },
-                )
+                },
+            )
 
-                for stream_attempt in range(MAX_RETRIES):
+            for stream_attempt in range(MAX_RETRIES):
+                async with request_client(client, stream_attempt) as active_client:
                     try:
                         has_yielded_model_data = False
-                        async for event_type, text in client.stream_generate_content(
+                        async for event_type, text in active_client.stream_generate_content(
                             model=model,
                             capture_prompt=normalized["capture_prompt"],
                             capture_images=normalized["capture_images"],
@@ -374,94 +364,105 @@ def _build_anthropic_streaming_response(
                                     )
                             elif event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
-                        break
                     except UsageLimitExceeded as exc:
                         runtime_state.record(model, "rate_limited")
                         record_rotator_event("rate_limited")
-                        if not has_yielded_model_data and stream_attempt < MAX_RETRIES - 1 and await try_switch_account():
-                            logger.warning("Anthropic stream 429 限流，已切换账号，重试 %d/%d", stream_attempt + 1, MAX_RETRIES)
+                        if (
+                            not has_yielded_model_data
+                            and stream_attempt < MAX_RETRIES - 1
+                            and await should_retry_rate_limit()
+                        ):
+                            logger.warning("Anthropic stream 429 限流，重试 %d/%d", stream_attempt + 1, MAX_RETRIES)
                             continue
                         raise exc
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
                             logger.warning("Anthropic stream 收到 204，清理 snapshot 缓存后重试一次")
-                            client.clear_snapshot_cache()
+                            active_client.clear_snapshot_cache()
                             continue
+                        record_rotator_event("error")
                         raise
                     except AuthError as exc:
                         if stream_attempt == 0:
                             logger.warning("Anthropic stream 鉴权异常，清理 snapshot 缓存后重试一次: %s", exc)
-                            client.clear_snapshot_cache()
+                            active_client.clear_snapshot_cache()
                             continue
+                        record_rotator_event("error")
+                        raise
+                    except Exception:
+                        record_rotator_event("error")
                         raise
 
-                if not saw_tool_use and not text_block_started and thinking_fragments:
-                    recovered_calls = _prepare_anthropic_function_calls(
-                        _fallback_function_calls_from_thinking(
-                            thinking="".join(thinking_fragments),
-                            allowed_names=tool_names,
-                            thought_signature=latest_thought_signature,
-                        )
-                    )
-                    for function_call in recovered_calls:
-                        saw_tool_use = True
-                        tool_index = content_block_index
-                        content_block_index += 1
-                        yield anthropic_sse(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": tool_index,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": function_call.get("anthropic_tool_use_id")
-                                    or f"toolu_{new_chat_id().removeprefix('chatcmpl-')}",
-                                    "name": function_call.get("name", "unknown"),
-                                    "input": {},
-                                },
-                            },
-                        )
-                        yield anthropic_sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": tool_index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": json.dumps(function_call_args(function_call), ensure_ascii=False),
-                                },
-                            },
-                        )
-                        yield anthropic_sse(
-                            "content_block_stop",
-                            {"type": "content_block_stop", "index": tool_index},
-                        )
+                    record_rotator_event("success")
+                    runtime_state.record(model, "success", final_usage)
+                    break
 
-                if text_block_started:
+            if not saw_tool_use and not text_block_started and thinking_fragments:
+                recovered_calls = _prepare_anthropic_function_calls(
+                    _fallback_function_calls_from_thinking(
+                        thinking="".join(thinking_fragments),
+                        allowed_names=tool_names,
+                        thought_signature=latest_thought_signature,
+                    )
+                )
+                for function_call in recovered_calls:
+                    saw_tool_use = True
+                    tool_index = content_block_index
+                    content_block_index += 1
+                    yield anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": tool_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": function_call.get("anthropic_tool_use_id")
+                                or f"toolu_{new_chat_id().removeprefix('chatcmpl-')}",
+                                "name": function_call.get("name", "unknown"),
+                                "input": {},
+                            },
+                        },
+                    )
+                    yield anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(function_call_args(function_call), ensure_ascii=False),
+                            },
+                        },
+                    )
                     yield anthropic_sse(
                         "content_block_stop",
-                        {"type": "content_block_stop", "index": text_block_index},
+                        {"type": "content_block_stop", "index": tool_index},
                     )
 
-                runtime_state.record(model, "success", final_usage)
+            if text_block_started:
                 yield anthropic_sse(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": "tool_use" if saw_tool_use else "end_turn",
-                            "stop_sequence": None,
-                        },
-                        "usage": anthropic_usage(final_usage).model_dump(mode="json"),
-                    },
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": text_block_index},
                 )
-                yield anthropic_sse("message_stop", {"type": "message_stop"})
-            except Exception as exc:
-                logger.error("Anthropic stream error: %s", exc, exc_info=True)
-                runtime_state.record(model, "errors")
-                yield anthropic_error_sse(str(exc))
-            finally:
-                cleanup_files(cleanup_paths)
+
+            yield anthropic_sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "tool_use" if saw_tool_use else "end_turn",
+                        "stop_sequence": None,
+                    },
+                    "usage": anthropic_usage(final_usage).model_dump(mode="json"),
+                },
+            )
+            yield anthropic_sse("message_stop", {"type": "message_stop"})
+        except Exception as exc:
+            logger.error("Anthropic stream error: %s", exc, exc_info=True)
+            runtime_state.record(model, "errors")
+            yield anthropic_error_sse(str(exc))
+        finally:
+            cleanup_files(cleanup_paths)
 
     return StreamingResponse(
         stream_response(),

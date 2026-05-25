@@ -77,9 +77,9 @@ class RequestCaptureService:
         return captured
 
     async def _ensure_template(self, model: str) -> CapturedRequest:
-        if model in self._templates:
-            return self._templates[model]
-
+        # BrowserSession owns the authoritative template cache because it is
+        # cleared whenever auth/profile changes. Always ask it for the template
+        # so this service cannot reuse stale templates after account switches.
         captured = await self._session.capture_template(model)
         template = CapturedRequest(**captured)
         self._templates[model] = template

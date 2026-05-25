@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
     from aistudio_api.config import settings
     from aistudio_api.infrastructure.account.account_store import AccountStore
     from aistudio_api.infrastructure.account.login_service import LoginService
+    from aistudio_api.application.account_client_pool import AccountClientPool
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.application.account_rotator import init_rotator, RotationMode
 
@@ -62,31 +63,57 @@ async def lifespan(app: FastAPI):
     )
     runtime_state.rotator = rotator
 
+    client_pool = None
+    if settings.account_pool_size > 0 or settings.account_pool_accounts:
+        client_pool = AccountClientPool(
+            account_store=account_store,
+            rotator=rotator,
+            port=runtime_state.browser_port,
+            size=settings.account_pool_size,
+            account_selectors=settings.account_pool_accounts,
+        )
+        if client_pool.enabled:
+            runtime_state.client_pool = client_pool
+        else:
+            logger.warning("浏览器池已配置但没有可用账号，将回退到单浏览器模式")
+
     logger.info(
-        "Client initialized (browser=%s, port=%s, rotation=%s, accounts=%d)",
+        "Client initialized (browser=%s, port=%s, rotation=%s, accounts=%d, pool=%d)",
         settings.browser_engine,
         runtime_state.browser_port,
         rotator.mode,
         len(account_store.list_accounts()),
+        client_pool.size if client_pool else 0,
     )
 
     # 后台预热浏览器，避免首次请求延迟
     warmup_task = None
+    pool_warmup_task = None
     async def _warmup():
         try:
             await client.warmup()
         except Exception as e:
             logger.warning("浏览器预热失败: %s", e)
-    warmup_task = asyncio.create_task(_warmup())
+    if runtime_state.client_pool is not None and settings.account_pool_warmup:
+        pool_warmup_task = asyncio.create_task(runtime_state.client_pool.warmup())
+    else:
+        warmup_task = asyncio.create_task(_warmup())
 
     yield
     logger.info("Shutting down")
-    if warmup_task and not warmup_task.done():
-        warmup_task.cancel()
+    pending_warmups = [task for task in (warmup_task, pool_warmup_task) if task is not None and not task.done()]
+    for task in pending_warmups:
+        task.cancel()
+    if pending_warmups:
+        await asyncio.gather(*pending_warmups, return_exceptions=True)
+    if runtime_state.client_pool is not None:
+        await runtime_state.client_pool.close()
+    await client.close()
     runtime_state.client = None
     runtime_state.busy_lock = None
     runtime_state.account_service = None
     runtime_state.rotator = None
+    runtime_state.client_pool = None
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)

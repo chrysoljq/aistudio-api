@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 
 import pytest
 from fastapi import HTTPException
@@ -60,11 +61,11 @@ class _CaptureImageClient:
 def test_handle_image_generation_passes_split_search_flags(monkeypatch):
     from aistudio_api.application import api_service_openai
 
-    async def _noop(*args, **kwargs):
-        return None
+    @asynccontextmanager
+    async def _request_client(client, attempt=0):
+        yield client
 
-    monkeypatch.setattr(api_service_openai, "require_busy_lock", lambda: asyncio.Semaphore(1))
-    monkeypatch.setattr(api_service_openai, "ensure_active_account", _noop)
+    monkeypatch.setattr(api_service_openai, "request_client", _request_client)
     monkeypatch.setattr(api_service_openai, "record_rotator_event", lambda *args, **kwargs: None)
 
     client = _CaptureImageClient()
@@ -81,11 +82,11 @@ def test_handle_image_generation_passes_split_search_flags(monkeypatch):
 def test_handle_image_generation_allows_default_tools_when_search_flags_omitted(monkeypatch):
     from aistudio_api.application import api_service_openai
 
-    async def _noop(*args, **kwargs):
-        return None
+    @asynccontextmanager
+    async def _request_client(client, attempt=0):
+        yield client
 
-    monkeypatch.setattr(api_service_openai, "require_busy_lock", lambda: asyncio.Semaphore(1))
-    monkeypatch.setattr(api_service_openai, "ensure_active_account", _noop)
+    monkeypatch.setattr(api_service_openai, "request_client", _request_client)
     monkeypatch.setattr(api_service_openai, "record_rotator_event", lambda *args, **kwargs: None)
 
     client = _CaptureImageClient()

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shutil
 import threading
 import time
 import uuid
@@ -137,9 +138,9 @@ TEMPLATE_CAPTURE_PROMPT = "say 't'"
 
 
 class BrowserSession:
-    def __init__(self, port: int):
+    def __init__(self, port: int, auth_file: str | None = None):
         self.port = port
-        self._auth_file = settings.auth_file or self._discover_active_auth_file()
+        self._auth_file = auth_file or settings.auth_file or self._discover_active_auth_file()
         self._profile_dir = self._derive_profile_dir(self._auth_file)
         self._hook_page = None
         self._ctx = None
@@ -158,6 +159,10 @@ class BrowserSession:
 
     async def switch_auth(self, auth_file: str | None) -> None:
         await self._run_sync(self._switch_auth_sync, auth_file)
+
+    async def close(self) -> None:
+        await self._run_sync(self._close_sync)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def ensure_hook_page(self):
         await self._run_sync(self._ensure_hook_page_sync)
@@ -247,10 +252,30 @@ class BrowserSession:
         async with self._snapshot_lock:
             return await loop.run_in_executor(self._executor, lambda: self._generate_snapshot_sync(contents))
 
-    async def send_hooked_request(self, *, body: str, timeout_ms: int) -> tuple[int, bytes]:
-        return await self._run_sync(self._send_hooked_request_sync, body, timeout_ms)
+    async def send_hooked_request(
+        self,
+        *,
+        body: str,
+        timeout_ms: int,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        return await self._run_sync(
+            self._send_hooked_request_sync,
+            body,
+            timeout_ms,
+            captured_url,
+            captured_headers,
+        )
 
-    async def send_streaming_request(self, *, body: str, timeout_ms: int):
+    async def send_streaming_request(
+        self,
+        *,
+        body: str,
+        timeout_ms: int,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
+    ):
         """Send a streaming request, yielding ("status", int) and ("chunk", bytes) events."""
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -259,7 +284,15 @@ class BrowserSession:
         def _stream_worker():
             try:
                 log.debug("[stream] worker started")
-                self._send_streaming_request_sync(body, timeout_ms, queue, loop, cancel_event)
+                self._send_streaming_request_sync(
+                    body,
+                    timeout_ms,
+                    queue,
+                    loop,
+                    cancel_event,
+                    captured_url,
+                    captured_headers,
+                )
                 log.debug("[stream] worker finished")
             except Exception as e:
                 log.debug(f"[stream] worker exception: {e}")
@@ -306,6 +339,22 @@ class BrowserSession:
             auth_file = fallback_auth_file
         return str(Path(auth_file).resolve().parent / "profile")
 
+    @staticmethod
+    def _cleanup_profile_singletons_sync(profile_dir: str | None) -> None:
+        if not profile_dir:
+            return
+        profile_path = Path(profile_dir)
+        if not profile_path.exists():
+            return
+        for path in profile_path.glob("Singleton*"):
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except Exception as exc:
+                log.debug("failed to remove stale Chromium singleton %s: %s", path, exc)
+
     def _bootstrap_google_session_sync(self, page) -> None:
         """Visit Google surfaces so Chromium can materialize a stable profile."""
         page.goto(GOOGLE_LOGIN_BOOTSTRAP_URL, wait_until="domcontentloaded", timeout=30000)
@@ -336,12 +385,22 @@ class BrowserSession:
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         cancel_event: threading.Event,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
     ):
         """Sync method: sends XHR request and consumes page-side stream events."""
         import time as _t
         _t0 = _t.time()
 
-        page, captured_url, captured_headers = self._prepare_streaming_sync()
+        if captured_url:
+            page = self._ensure_botguard_service_sync()
+            captured_headers = {
+                k: v
+                for k, v in (captured_headers or {}).items()
+                if k.lower() not in ("host", "content-length")
+            }
+        else:
+            page, captured_url, captured_headers = self._prepare_streaming_sync()
         log.debug(f"[stream] prep done in {_t.time()-_t0:.1f}s, url={captured_url}")
 
         timeout_s = timeout_ms / 1000
@@ -517,11 +576,12 @@ class BrowserSession:
         return page, url, headers
 
     def _switch_auth_sync(self, auth_file: str | None) -> None:
+        self._close_sync()
         self._auth_file = auth_file
         self._profile_dir = self._derive_profile_dir(auth_file)
         self._templates.clear()
         self._bootstrap_template = None
-        self._close_sync()
+        self._cleanup_profile_singletons_sync(self._profile_dir)
 
     def _ensure_browser_sync(self):
         if self._ctx is not None and self._hook_page is not None and not self._hook_page.is_closed():
@@ -570,10 +630,16 @@ class BrowserSession:
             # causing Google to flag the profile's cookie state as inconsistent.
             should_seed_from_auth = not (profile_path.exists() and any(profile_path.iterdir()))
             profile_path.mkdir(parents=True, exist_ok=True)
-            self._ctx = sync_launch_persistent_context(
-                profile_dir,
-                **build_browser_context_options(),
-            )
+            self._cleanup_profile_singletons_sync(profile_dir)
+            try:
+                self._ctx = sync_launch_persistent_context(
+                    profile_dir,
+                    **build_browser_context_options(),
+                )
+            except Exception:
+                self._close_sync()
+                self._cleanup_profile_singletons_sync(profile_dir)
+                raise
             self._browser = None
             self._cf = None
             self._playwright = None
@@ -1035,12 +1101,25 @@ mw:((hash) => {
             raise RuntimeError(f"image upload incomplete: expected={len(image_paths)} uploaded={len(uploaded_ids)}")
         return uploaded_ids
 
-    def _send_hooked_request_sync(self, body: str, timeout_ms: int) -> tuple[int, bytes]:
+    def _send_hooked_request_sync(
+        self,
+        body: str,
+        timeout_ms: int,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
         import time as _t
         _t0 = _t.time()
         page = self._ensure_botguard_service_sync()
         log.debug(f"[timing] botguard ready in {_t.time()-_t0:.1f}s")
-        captured_url, captured_headers = self._get_captured_info()
+        if captured_url:
+            captured_headers = {
+                k: v
+                for k, v in (captured_headers or {}).items()
+                if k.lower() not in ("host", "content-length")
+            }
+        else:
+            captured_url, captured_headers = self._get_captured_info()
 
         # Replay via XHR in browser context (same approach as non-streaming replay_v2)
         timeout_s = timeout_ms / 1000

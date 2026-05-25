@@ -149,13 +149,13 @@ class AccountRotator:
         """最久未用优先。"""
         if not available:
             return None
-        return min(available, key=lambda x: x[1].last_used if x[1].last_used > 0 else float("inf"))
+        return min(available, key=lambda x: x[1].last_used if x[1].last_used > 0 else 0.0)
 
     def _pick_least_rl(self, available: list[tuple[AccountMeta, AccountStats]]) -> tuple[AccountMeta, AccountStats] | None:
         """最少限流优先。"""
         if not available:
             return None
-        return min(available, key=lambda x: x[1].rate_limited)
+        return min(available, key=lambda x: (x[1].rate_limited, x[1].last_used))
 
     async def get_next_account(self) -> AccountMeta | None:
         """获取下一个可用的账号。"""

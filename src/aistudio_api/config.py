@@ -74,6 +74,20 @@ def _load_api_keys() -> frozenset[str]:
     return frozenset(values)
 
 
+def _load_list_env(*names: str) -> tuple[str, ...]:
+    value = _load_env(*names)
+    if value is None:
+        return ()
+
+    items: list[str] = []
+    for line in value.splitlines():
+        for part in line.split(","):
+            item = part.strip()
+            if item and item not in items:
+                items.append(item)
+    return tuple(items)
+
+
 def _default_chromium_sandbox() -> bool:
     # On many recent Linux distros (including Ubuntu with AppArmor userns
     # restrictions), Chromium sandboxing is unavailable unless the host has been
@@ -178,8 +192,12 @@ class Settings:
     # 账号轮询配置
     account_rotation_mode: str = os.getenv("AISTUDIO_ACCOUNT_ROTATION_MODE", "round_robin")  # round_robin, lru, least_rl
     account_cooldown_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_COOLDOWN_SECONDS", "60"))
+    account_rotation_sticky_seconds: int = int(os.getenv("AISTUDIO_ACCOUNT_ROTATION_STICKY_SECONDS", "0"))
     account_max_retries: int = int(os.getenv("AISTUDIO_ACCOUNT_MAX_RETRIES", "3"))
     max_concurrency: int = int(os.getenv("AISTUDIO_MAX_CONCURRENCY", "3"))
+    account_pool_size: int = int(os.getenv("AISTUDIO_ACCOUNT_POOL_SIZE", "0"))
+    account_pool_accounts: tuple[str, ...] = _load_list_env("AISTUDIO_ACCOUNT_POOL_ACCOUNTS")
+    account_pool_warmup: bool = _load_bool_env("AISTUDIO_ACCOUNT_POOL_WARMUP", default=True)
 
     @property
     def camoufox_port(self) -> int:
