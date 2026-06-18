@@ -29,9 +29,66 @@ from aistudio_api.application.api_service_common import (
     require_busy_lock,
     try_switch_account,
 )
-from aistudio_api.application.chat_service import cleanup_files, normalize_anthropic_request
+from aistudio_api.application.chat_service import (
+    ANTHROPIC_TOOL_HISTORY_END,
+    ANTHROPIC_TOOL_HISTORY_START,
+    cleanup_files,
+    normalize_anthropic_request,
+)
 from aistudio_api.domain.errors import AistudioError, AuthError, RequestError, UsageLimitExceeded
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
+
+
+def _longest_marker_prefix_suffix(text: str, marker: str) -> int:
+    max_length = min(len(text), len(marker) - 1)
+    for length in range(max_length, 0, -1):
+        if marker.startswith(text[-length:]):
+            return length
+    return 0
+
+
+def _filter_internal_tool_history_delta(text: str, *, state: dict[str, object], final: bool = False) -> str:
+    """Drop leaked internal tool-history transcript fragments from model text."""
+    pending = str(state.get("pending") or "")
+    remaining = pending + (text or "")
+    state["pending"] = ""
+    output_parts: list[str] = []
+
+    while remaining:
+        if state.get("in_tool_history"):
+            end_index = remaining.find(ANTHROPIC_TOOL_HISTORY_END)
+            if end_index < 0:
+                keep = _longest_marker_prefix_suffix(remaining, ANTHROPIC_TOOL_HISTORY_END)
+                state["pending"] = remaining[-keep:] if keep else ""
+                return "".join(output_parts)
+            remaining = remaining[end_index + len(ANTHROPIC_TOOL_HISTORY_END) :]
+            state["in_tool_history"] = False
+            continue
+
+        start_index = remaining.find(ANTHROPIC_TOOL_HISTORY_START)
+        if start_index < 0:
+            keep = 0 if final else _longest_marker_prefix_suffix(remaining, ANTHROPIC_TOOL_HISTORY_START)
+            if keep:
+                output_parts.append(remaining[:-keep])
+                state["pending"] = remaining[-keep:]
+            else:
+                output_parts.append(remaining)
+            break
+
+        output_parts.append(remaining[:start_index])
+        remaining = remaining[start_index + len(ANTHROPIC_TOOL_HISTORY_START) :]
+        state["in_tool_history"] = True
+
+    if final and not state.get("in_tool_history") and state.get("pending"):
+        output_parts.append(str(state["pending"]))
+        state["pending"] = ""
+
+    return "".join(output_parts)
+
+
+def _filter_internal_tool_history_text(text: str) -> str:
+    state = {"in_tool_history": False}
+    return _filter_internal_tool_history_delta(text or "", state=state, final=True)
 
 
 def _anthropic_tool_names(req: AnthropicMessageRequest) -> set[str]:
@@ -221,7 +278,7 @@ async def handle_anthropic_messages(req: AnthropicMessageRequest, client: AIStud
                     function_calls = _prepare_anthropic_function_calls(raw_function_calls)
                     return anthropic_message_response(
                         model=model,
-                        content=output.text,
+                        content=_filter_internal_tool_history_text(output.text),
                         usage=output.usage,
                         function_calls=function_calls,
                     )
@@ -293,6 +350,7 @@ def _build_anthropic_streaming_response(
 
                 for stream_attempt in range(MAX_RETRIES):
                     try:
+                        tool_history_filter_state = {"in_tool_history": False}
                         has_yielded_model_data = False
                         async for event_type, text in client.stream_generate_content(
                             model=model,
@@ -309,6 +367,12 @@ def _build_anthropic_streaming_response(
                             force_refresh_capture=stream_attempt > 0,
                         ):
                             if event_type == "body" and text:
+                                text = _filter_internal_tool_history_delta(
+                                    str(text),
+                                    state=tool_history_filter_state,
+                                )
+                                if not text:
+                                    continue
                                 has_yielded_model_data = True
                                 if not text_block_started:
                                     text_block_index = content_block_index
@@ -375,6 +439,33 @@ def _build_anthropic_streaming_response(
                                     )
                             elif event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
+                        text = _filter_internal_tool_history_delta(
+                            "",
+                            state=tool_history_filter_state,
+                            final=True,
+                        )
+                        if text:
+                            has_yielded_model_data = True
+                            if not text_block_started:
+                                text_block_index = content_block_index
+                                content_block_index += 1
+                                text_block_started = True
+                                yield anthropic_sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": text_block_index,
+                                        "content_block": {"type": "text", "text": ""},
+                                    },
+                                )
+                            yield anthropic_sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_index,
+                                    "delta": {"type": "text_delta", "text": text},
+                                },
+                            )
                         break
                     except UsageLimitExceeded as exc:
                         runtime_state.record(model, "rate_limited")
@@ -385,14 +476,12 @@ def _build_anthropic_streaming_response(
                         raise exc
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
-                            logger.warning("Anthropic stream 收到 204，清理 snapshot 缓存后重试一次")
-                            client.clear_snapshot_cache()
+                            logger.warning("Anthropic stream 收到 204，刷新 capture 后重试一次")
                             continue
                         raise
                     except AuthError as exc:
                         if stream_attempt == 0:
-                            logger.warning("Anthropic stream 鉴权异常，清理 snapshot 缓存后重试一次: %s", exc)
-                            client.clear_snapshot_cache()
+                            logger.warning("Anthropic stream 鉴权异常，刷新 capture 后重试一次: %s", exc)
                             continue
                         raise
 

@@ -136,6 +136,36 @@ BOTGUARD_BOOTSTRAP_PROMPT = "say '1'"
 TEMPLATE_CAPTURE_PROMPT = "say 't'"
 
 
+def _snapshot_content_hash(contents: list[AistudioContent]) -> str:
+    hash_parts: list[str] = []
+    for content in contents:
+        for part in content.parts:
+            if part.inline_data:
+                hash_parts.append(part.inline_data[1])  # base64 data
+            if part.text:
+                hash_parts.append(str(part.text))
+            if part.thought_signature:
+                hash_parts.append(str(part.thought_signature))
+    return sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
+
+
+def _is_aistudio_url(url: str) -> bool:
+    return "aistudio.google.com" in (url or "")
+
+
+def _is_google_signin_url(url: str) -> bool:
+    return "accounts.google.com" in (url or "") and "signin" in (url or "")
+
+
+def _clear_chromium_profile_locks(profile_path: Path) -> None:
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        lock_path = profile_path / name
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception as exc:
+            log.debug("Failed to remove Chromium profile lock %s: %s", lock_path, exc)
+
+
 class BrowserSession:
     def __init__(self, port: int):
         self.port = port
@@ -244,10 +274,24 @@ class BrowserSession:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, lambda: self._generate_snapshot_sync(contents))
 
-    async def send_hooked_request(self, *, body: str, timeout_ms: int) -> tuple[int, bytes]:
-        return await self._run_sync(self._send_hooked_request_sync, body, timeout_ms)
+    async def send_hooked_request(
+        self,
+        *,
+        body: str,
+        timeout_ms: int,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        return await self._run_sync(self._send_hooked_request_sync, body, timeout_ms, url, headers)
 
-    async def send_streaming_request(self, *, body: str, timeout_ms: int):
+    async def send_streaming_request(
+        self,
+        *,
+        body: str,
+        timeout_ms: int,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         """Send a streaming request, yielding ("status", int) and ("chunk", bytes) events."""
         queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -256,7 +300,7 @@ class BrowserSession:
         def _stream_worker():
             try:
                 log.debug("[stream] worker started")
-                self._send_streaming_request_sync(body, timeout_ms, queue, loop, cancel_event)
+                self._send_streaming_request_sync(body, timeout_ms, queue, loop, cancel_event, url, headers)
                 log.debug("[stream] worker finished")
             except Exception as e:
                 log.debug(f"[stream] worker exception: {e}")
@@ -325,6 +369,19 @@ class BrowserSession:
                 return url, headers
         raise RuntimeError("no captured URL available for replay")
 
+    def _resolve_captured_info(
+        self,
+        captured_url: str | None,
+        captured_headers: dict[str, str] | None,
+    ) -> tuple[str, dict[str, str]]:
+        if captured_url is None or captured_headers is None:
+            fallback_url, fallback_headers = self._get_captured_info()
+            if captured_url is None:
+                captured_url = fallback_url
+            if captured_headers is None:
+                captured_headers = fallback_headers
+        return captured_url, captured_headers
+
     def _send_streaming_request_sync(
         self,
         body: str,
@@ -332,12 +389,15 @@ class BrowserSession:
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         cancel_event: threading.Event,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
     ):
         """Sync method: sends XHR request and consumes page-side stream events."""
         import time as _t
         _t0 = _t.time()
 
-        page, captured_url, captured_headers = self._prepare_streaming_sync()
+        page = self._ensure_botguard_service_sync()
+        captured_url, captured_headers = self._resolve_captured_info(captured_url, captured_headers)
         log.debug(f"[stream] prep done in {_t.time()-_t0:.1f}s, url={captured_url}")
 
         timeout_s = timeout_ms / 1000
@@ -566,6 +626,7 @@ class BrowserSession:
             # causing Google to flag the profile's cookie state as inconsistent.
             should_seed_from_auth = not (profile_path.exists() and any(profile_path.iterdir()))
             profile_path.mkdir(parents=True, exist_ok=True)
+            _clear_chromium_profile_locks(profile_path)
             self._ctx = sync_launch_persistent_context(
                 profile_dir,
                 **build_browser_context_options(),
@@ -813,15 +874,7 @@ class BrowserSession:
         if not self._snap_key:
             raise RuntimeError("Snapshot function not detected")
 
-        # 计算 content hash（包含图片数据，与 camoufox-api 一致）
-        hash_parts: list[str] = []
-        for content in contents:
-            for part in content.parts:
-                if part.inline_data:
-                    hash_parts.append(part.inline_data[1])  # base64 data
-                if part.text:
-                    hash_parts.append(str(part.text))
-        content_hash = sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
+        content_hash = _snapshot_content_hash(contents)
 
         page.evaluate(
             """
@@ -1025,12 +1078,18 @@ mw:((hash) => {
             raise RuntimeError(f"image upload incomplete: expected={len(image_paths)} uploaded={len(uploaded_ids)}")
         return uploaded_ids
 
-    def _send_hooked_request_sync(self, body: str, timeout_ms: int) -> tuple[int, bytes]:
+    def _send_hooked_request_sync(
+        self,
+        body: str,
+        timeout_ms: int,
+        captured_url: str | None = None,
+        captured_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
         import time as _t
         _t0 = _t.time()
         page = self._ensure_botguard_service_sync()
         log.debug(f"[timing] botguard ready in {_t.time()-_t0:.1f}s")
-        captured_url, captured_headers = self._get_captured_info()
+        captured_url, captured_headers = self._resolve_captured_info(captured_url, captured_headers)
 
         # Replay via XHR in browser context (same approach as non-streaming replay_v2)
         timeout_s = timeout_ms / 1000
@@ -1079,14 +1138,24 @@ mw:((hash) => {
                 log.debug(f"[timing] goto {url} took {_t.time()-_t0:.1f}s")
                 # 检查是否被重定向到登录页
                 current_url = page.url or ""
-                if "accounts.google.com" in current_url and "signin" in current_url:
+                if _is_google_signin_url(current_url):
                     raise RuntimeError(
                         f"Cookie 认证失败，已被重定向到 Google 登录页。"
                         f" (url={current_url})"
                     )
+                if not _is_aistudio_url(current_url):
+                    raise RuntimeError(f"AI Studio redirected away before UI ready: url={current_url}")
                 # Wait for SPA framework and chat UI to render
                 for _ in range(60):
                     page.wait_for_timeout(1000)
+                    current_url = page.url or ""
+                    if _is_google_signin_url(current_url):
+                        raise RuntimeError(
+                            f"Cookie 认证失败，已被重定向到 Google 登录页。"
+                            f" (url={current_url})"
+                        )
+                    if not _is_aistudio_url(current_url):
+                        raise RuntimeError(f"AI Studio redirected away before UI ready: url={current_url}")
                     has_dms = page.evaluate("mw:!!window.default_MakerSuite")
                     has_textarea = page.query_selector("textarea") is not None
                     if has_dms and has_textarea:
@@ -1095,9 +1164,10 @@ mw:((hash) => {
                         return
                     if has_dms and _ > 20:
                         page.evaluate(DIALOG_CLEANUP_JS)
-                log.debug(f"[timing] UI partially ready after {_t.time()-_t0:.1f}s (dms={has_dms}, textarea={has_textarea})")
-                self._save_cookies_sync()
-                return
+                raise RuntimeError(
+                    f"AI Studio UI not ready after {_t.time()-_t0:.1f}s "
+                    f"(url={page.url}, dms={has_dms}, textarea={has_textarea})"
+                )
             except Exception as exc:
                 log.debug(f"[timing] goto {url} failed after {_t.time()-_t0:.1f}s: {exc}")
                 last_exc = exc

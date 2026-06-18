@@ -7,7 +7,6 @@ import logging
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
-from aistudio_api.infrastructure.cache.snapshot_cache import SnapshotCache
 from aistudio_api.infrastructure.gateway.request_rewriter import modify_body
 from aistudio_api.infrastructure.gateway.session import BrowserSession
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
@@ -32,9 +31,8 @@ class CapturedRequest:
 class RequestCaptureService:
     """Single-page hook flow modeled after camoufox-api."""
 
-    def __init__(self, session: BrowserSession, snapshot_cache: SnapshotCache):
+    def __init__(self, session: BrowserSession):
         self._session = session
-        self._snapshot_cache = snapshot_cache
         self._templates: dict[str, CapturedRequest] = {}
 
     async def capture(

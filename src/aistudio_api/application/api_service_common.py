@@ -66,9 +66,7 @@ async def try_switch_account() -> bool:
     result = await account_service.activate_account(
         next_account.id,
         client._session,
-        runtime_state.snapshot_cache,
         None,  # skip lock — caller already holds it
-        keep_snapshot_cache=False,
     )
     return result is not None
 

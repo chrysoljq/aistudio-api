@@ -114,6 +114,8 @@ class StreamingGateway:
         async for event_type, payload in self._session.send_streaming_request(
             body=modified_body,
             timeout_ms=settings.timeout_stream * 1000,
+            url=captured.url,
+            headers={k: v for k, v in captured.headers.items() if k.lower() not in ("host", "content-length")},
         ):
             if event_type == "status" and payload and not status_code:
                 status_code = int(payload)

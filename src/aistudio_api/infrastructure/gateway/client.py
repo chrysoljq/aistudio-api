@@ -10,7 +10,6 @@ from typing import Optional
 from aistudio_api.config import DEFAULT_BROWSER_PORT, DEFAULT_IMAGE_MODEL, DEFAULT_TEXT_MODEL, settings
 from aistudio_api.domain.errors import RequestError, classify_error
 from aistudio_api.domain.models import ModelOutput, parse_image_output, parse_text_output
-from aistudio_api.infrastructure.cache.snapshot_cache import SnapshotCache
 from aistudio_api.infrastructure.gateway.capture import CapturedRequest, RequestCaptureService
 from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
 from aistudio_api.infrastructure.gateway.request_rewriter import TOOLS_TEMPLATES, build_image_generation_search_tool, modify_body
@@ -20,8 +19,6 @@ from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent, AistudioPart
 
 logger = logging.getLogger("aistudio")
-
-_snapshot_cache = SnapshotCache()
 
 
 class AIStudioClient:
@@ -49,7 +46,7 @@ class AIStudioClient:
         self.port = port
         self._captured: Optional[CapturedRequest] = None
         self._session = BrowserSession(port=port)
-        self._capture_service = RequestCaptureService(self._session, _snapshot_cache)
+        self._capture_service = RequestCaptureService(self._session)
         self._replay_service = RequestReplayService(session=self._session)
         
         self._streaming_gateway = StreamingGateway(session=self._session)
@@ -64,10 +61,6 @@ class AIStudioClient:
         """切换账号的 auth 文件。"""
         if self._session is not None:
             await self._session.switch_auth(auth_file)
-
-    def clear_snapshot_cache(self) -> None:
-        """清除 snapshot 缓存。"""
-        _snapshot_cache.clear()
 
     def _dump_raw_exchange(
         self,

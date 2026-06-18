@@ -167,10 +167,10 @@ def test_modify_body_applies_model_safety_defaults():
 
     body = json.loads(rewritten)
     assert body[2] == [
-        [None, None, 7, 4],
-        [None, None, 8, 4],
-        [None, None, 9, 4],
-        [None, None, 10, 4],
+        [None, None, 7, 5],
+        [None, None, 8, 5],
+        [None, None, 9, 5],
+        [None, None, 10, 5],
     ]
 
 

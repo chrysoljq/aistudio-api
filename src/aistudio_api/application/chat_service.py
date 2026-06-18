@@ -389,6 +389,18 @@ def normalize_openai_tools(tools) -> list[list] | None:
     return [[None, [encode_function_declaration_to_wire(decl) for decl in function_declarations]]]
 
 
+ANTHROPIC_TOOL_HISTORY_INSTRUCTION = (
+    "The conversation may include INTERNAL TOOL HISTORY records converted from "
+    "Anthropic tool_use/tool_result blocks. Treat those records only as prior "
+    "tool-call context. Do not quote, repeat, translate, or expose their wrapper "
+    "text in the final answer. Use the recorded tool results to answer the user's "
+    "actual request."
+)
+
+ANTHROPIC_TOOL_HISTORY_START = "<internal_anthropic_tool_history>"
+ANTHROPIC_TOOL_HISTORY_END = "</internal_anthropic_tool_history>"
+
+
 def normalize_anthropic_request(req, tmp_dir: str = "/tmp", tool_context: dict[str, dict] | None = None) -> dict:
     system_text = _anthropic_system_text(req.system)
     contents: list[AistudioContent] = []
@@ -397,6 +409,7 @@ def normalize_anthropic_request(req, tmp_dir: str = "/tmp", tool_context: dict[s
     cleanup_paths: list[str] = []
     pending_tool_parts: list[AistudioPart] = []
     tool_id_to_name = _anthropic_tool_id_name_map(req.messages)
+    tool_context = tool_context or {}
 
     def flush_tool_parts():
         if pending_tool_parts:
@@ -411,10 +424,18 @@ def normalize_anthropic_request(req, tmp_dir: str = "/tmp", tool_context: dict[s
             tool_results = [block for block in content if block.type == "tool_result"]
             other_blocks = [block for block in content if block.type != "tool_result"]
             for block in tool_results:
-                function_name = tool_id_to_name.get(block.tool_use_id or "") or block.name or "unknown_function"
+                tool_info = _anthropic_tool_context(block.tool_use_id, tool_context)
+                function_name = (
+                    tool_info.get("name")
+                    or tool_id_to_name.get(block.tool_use_id or "")
+                    or block.name
+                    or "unknown_function"
+                )
                 capture_text = _anthropic_tool_result_text(block.content)
                 text = capture_text or json.dumps(_anthropic_tool_result_response(block.content), ensure_ascii=False)
-                pending_tool_parts.append(AistudioPart(text=f"Tool result for {function_name}: {text}"))
+                pending_tool_parts.append(
+                    AistudioPart(text=_anthropic_tool_result_transcript(function_name, text))
+                )
                 if capture_text:
                     capture_texts.append(capture_text)
             if tool_results and not other_blocks:
@@ -448,14 +469,9 @@ def normalize_anthropic_request(req, tmp_dir: str = "/tmp", tool_context: dict[s
                         image_paths.append(image_path)
                         cleanup_paths.append(image_path)
                 elif role == "assistant" and block.type == "tool_use" and block.name:
-                    parts.append(
-                        AistudioPart(
-                            text=(
-                                f"Tool call {block.name} with input: "
-                                f"{json.dumps(block.input or {}, ensure_ascii=False)}"
-                            )
-                        )
-                    )
+                    # AI Studio rejects replayed historical tool calls. The matching
+                    # tool_result carries the useful context without exposing inputs.
+                    continue
 
         for image_path in image_paths:
             parts.append(_image_path_to_part(image_path))
@@ -472,11 +488,13 @@ def normalize_anthropic_request(req, tmp_dir: str = "/tmp", tool_context: dict[s
     capture_prompt = "\n".join(text for text in capture_texts if text) or "你好"
     model = req.model
 
+    system_instruction_text = _anthropic_system_instruction(system_text, contents)
+
     return {
         "model": model,
         "system_instruction": (
-            AistudioContent(role="user", parts=[AistudioPart(text=system_text)])
-            if system_text
+            AistudioContent(role="user", parts=[AistudioPart(text=system_instruction_text)])
+            if system_instruction_text
             else None
         ),
         "contents": contents or [AistudioContent(role="user", parts=[AistudioPart(text="你好")])],
@@ -548,6 +566,35 @@ def _anthropic_tool_id_name_map(messages) -> dict[str, str]:
             if block.type == "tool_use" and block.id and block.name:
                 mapping[block.id] = block.name
     return mapping
+
+
+def _anthropic_tool_context(tool_use_id: str | None, tool_context: dict[str, dict]) -> dict[str, Any]:
+    if not tool_use_id:
+        return {}
+    context = tool_context.get(tool_use_id)
+    return context if isinstance(context, dict) else {}
+
+
+def _anthropic_system_instruction(system_text: str | None, contents: list[AistudioContent]) -> str | None:
+    has_tool_history = any(
+        part.text and ANTHROPIC_TOOL_HISTORY_START in part.text
+        for content in contents
+        for part in content.parts
+    )
+    if not has_tool_history:
+        return system_text
+    if system_text:
+        return f"{system_text}\n\n{ANTHROPIC_TOOL_HISTORY_INSTRUCTION}"
+    return ANTHROPIC_TOOL_HISTORY_INSTRUCTION
+
+
+def _anthropic_tool_result_transcript(function_name: str, text: str) -> str:
+    return (
+        f"{ANTHROPIC_TOOL_HISTORY_START}\n"
+        f"user tool_result for: {function_name}\n"
+        f"tool_result content:\n{text}\n"
+        f"{ANTHROPIC_TOOL_HISTORY_END}"
+    )
 
 
 def _anthropic_image_source_to_file(source: dict[str, Any], tmp_dir: str = "/tmp") -> str | None:

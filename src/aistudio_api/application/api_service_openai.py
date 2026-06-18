@@ -319,14 +319,12 @@ def _build_streaming_response(
                         raise
                     except RequestError as exc:
                         if exc.status == 204 and stream_attempt == 0:
-                            logger.warning("Stream 收到 204，清理 snapshot 缓存后重试一次")
-                            client.clear_snapshot_cache()
+                            logger.warning("Stream 收到 204，刷新 capture 后重试一次")
                             continue
                         raise
                     except AuthError as exc:
                         if stream_attempt == 0:
-                            logger.warning("Stream 鉴权异常，清理 snapshot 缓存后重试一次: %s", exc)
-                            client.clear_snapshot_cache()
+                            logger.warning("Stream 鉴权异常，刷新 capture 后重试一次: %s", exc)
                             continue
                         raise
 

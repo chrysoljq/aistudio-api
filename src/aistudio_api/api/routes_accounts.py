@@ -126,17 +126,14 @@ async def activate_account(
     runtime_state=Depends(get_runtime_state),
 ):
     """切换到指定账号。"""
-    # 从 runtime_state 获取 browser_session, snapshot_cache, busy_lock
+    # 从 runtime_state 获取 browser_session 和 busy_lock
     browser_session = runtime_state.client._session if runtime_state.client else None
-    snapshot_cache = runtime_state.snapshot_cache
     busy_lock = runtime_state.busy_lock
 
     if browser_session is None:
         raise HTTPException(status_code=503, detail="服务未就绪")
 
-    account = await account_service.activate_account(
-        account_id, browser_session, snapshot_cache, busy_lock
-    )
+    account = await account_service.activate_account(account_id, browser_session, busy_lock)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在或切换失败")
     return AccountResponse(

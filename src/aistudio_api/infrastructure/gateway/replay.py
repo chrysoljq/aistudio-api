@@ -29,6 +29,8 @@ class RequestReplayService:
                 return await self._session.send_hooked_request(
                     body=body,
                     timeout_ms=timeout * 1000,
+                    url=captured.url,
+                    headers=headers,
                 )
 
             import aiohttp

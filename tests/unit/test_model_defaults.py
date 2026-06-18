@@ -8,10 +8,10 @@ def test_resolve_model_defaults_uses_repo_config_for_gemma():
     assert defaults.default_tools == ("google_search",)
     assert defaults.is_image_model is False
     assert defaults.safety_settings == (
-        (None, None, 7, 4),
-        (None, None, 8, 4),
-        (None, None, 9, 4),
-        (None, None, 10, 4),
+        (None, None, 7, 5),
+        (None, None, 8, 5),
+        (None, None, 9, 5),
+        (None, None, 10, 5),
     )
 
 
