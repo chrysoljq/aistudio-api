@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import uuid
@@ -23,6 +24,8 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     ThinkingLevel,
 )
 from aistudio_api.infrastructure.gateway.wire_codec import TOOLS_TEMPLATES
+
+logger = logging.getLogger("aistudio.chat")
 
 
 SCHEMA_TYPE_CODES = {
@@ -383,7 +386,11 @@ def _normalize_gemini_safety_settings(value: Any) -> list[list[Any]]:
 
         category = _GEMINI_SAFETY_CATEGORY_MAP.get(str(item.category).strip().upper())
         if category is None:
-            raise ValueError(f"Unsupported safety category: {item.category}")
+            # The AI Studio wire format only supports the 4 categories above.
+            # Unsupported categories (e.g. HARM_CATEGORY_CIVIC_INTEGRITY) are
+            # ignored instead of failing the request with a 400.
+            logger.warning("Ignoring unsupported safety category: %s", item.category)
+            continue
         threshold = _GEMINI_SAFETY_THRESHOLD_MAP.get(str(item.threshold).strip().upper())
         if threshold is None:
             raise ValueError(f"Unsupported safety threshold: {item.threshold}")
