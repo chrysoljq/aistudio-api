@@ -34,6 +34,8 @@ class OpenAIChatMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: str
     thinking: str | None = None
+    # Conventional field read by DeepSeek/OpenRouter-style clients
+    reasoning_content: str | None = None
     tool_calls: list[OpenAIToolCall] | None = None
 
 
@@ -56,6 +58,8 @@ class OpenAIChatDelta(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: str | None = None
     thinking: str | None = None
+    # Conventional field read by DeepSeek/OpenRouter-style clients
+    reasoning_content: str | None = None
     tool_calls: list[OpenAIToolCall] | None = None
 
 

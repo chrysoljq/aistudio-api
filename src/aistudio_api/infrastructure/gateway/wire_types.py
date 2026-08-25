@@ -205,6 +205,14 @@ class AistudioGenerationConfig:
     def enable_default_thinking(self):
         if self.thinking_config is None:
             self.thinking_config = AistudioThinkingConfig.default().to_wire()
+        # Match the AI Studio frontend request: index 13 = 1 enables thought
+        # summaries, while an explicit response_mime_type ("text/plain")
+        # suppresses them on Gemini models.
+        self._ensure_len(14)
+        if self.values[13] is None:
+            self.values[13] = 1
+        if len(self.values) > 7 and self.values[7] == "text/plain":
+            self.values[7] = None
 
     def sanitize_for_plain_text(self):
         self.response_mime_type = "text/plain"

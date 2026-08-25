@@ -234,14 +234,19 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
 
                 record_rotator_event("success")
                 runtime_state.record(normalized["model"], "success", final_usage)
-                if final_usage:
-                    yield "data: " + json.dumps(
+                # Always send a terminal chunk with finishReason="STOP";
+                # without it clients report the response as ended abnormally ("other").
+                final_chunk: dict = {
+                    "candidates": [
                         {
-                            "candidates": [],
-                            "usageMetadata": to_gemini_usage_metadata(final_usage).model_dump(mode="json"),
-                        },
-                        ensure_ascii=False,
-                    ) + "\n\n"
+                            "content": {"role": "model", "parts": []},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+                if final_usage:
+                    final_chunk["usageMetadata"] = to_gemini_usage_metadata(final_usage).model_dump(mode="json")
+                yield "data: " + json.dumps(final_chunk, ensure_ascii=False) + "\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:
                 logger.error("Gemini stream error: %s", exc, exc_info=True)
