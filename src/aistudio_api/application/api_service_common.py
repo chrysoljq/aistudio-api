@@ -130,3 +130,56 @@ def stats_response() -> StatsResponse:
     )
     models = {name: ModelStatsResponse(**values) for name, values in stats.items()}
     return StatsResponse(models=models, totals=totals)
+
+
+# ============================================================================
+# ARM overlay (2026-09-24, guo-issue-202609242350)：上游内容过滤可见化共享件。
+# 背景：AI Studio wire 对被过滤请求返回空 content + 非 0 finish 码（实测 11=带
+# 政策文案 / 15=无文案）。上游实现把 finish 码丢弃、空 content 静默 200，消费端
+# 只能看到空结果或系统异常，内容决策被伪装成系统故障（反模式见 GUO
+# memos/空内容语义丢失伪装成系统故障反模式）。本组 helper 只做「如实翻译」，
+# 不改变也不绕过上游过滤行为。
+# ============================================================================
+
+def arm_block_notice(output) -> str:
+    """非流式：把「空内容 + 非 0 finish 码」翻译成可读文本。
+
+    判定域与 2026-09-24 首版 overlay 逐位一致：text/images/function_calls 任一
+    存在即视为有内容（thinking 不参与判定，会经 to_gemini_parts 原样透传）。
+    仅当上游确实没产出任何内容且带非零 finish 码时返回非空字符串；否则返回 ""，
+    不影响正常路径。绝无异常外抛。
+    """
+    try:
+        if output.text or output.images or output.function_calls:
+            return ""
+        candidates = output.candidates or []
+        if not candidates:
+            return ""
+        finish_code = candidates[0].finish_reason
+        if not finish_code:
+            return ""
+        finish_message = (candidates[0].finish_message or "").strip()
+        return _arm_notice_text(finish_code, finish_message)
+    except Exception:
+        return ""
+
+
+def arm_block_notice_from_finish(finish: dict | None) -> str:
+    """流式：把 gateway 透出的 finish 事件翻译成可读文本。语义同 arm_block_notice。"""
+    try:
+        if not finish:
+            return ""
+        finish_code = finish.get("code")
+        if not finish_code:
+            return ""
+        return _arm_notice_text(finish_code, (finish.get("message") or "").strip())
+    except Exception:
+        return ""
+
+
+def _arm_notice_text(finish_code, finish_message: str) -> str:
+    return (
+        f"上游未返回内容（finish_code={finish_code}）"
+        + (f"：{finish_message}" if finish_message
+           else "：生成结果被内容安全策略拦截，请调整提示词后重试")
+    )

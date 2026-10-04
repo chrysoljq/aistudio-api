@@ -223,17 +223,31 @@ class AistudioWireCodec:
             request.generation_config.top_p = top_p
         if top_k is not None:
             request.generation_config.top_k = top_k
-        for attr, value in (generation_config_overrides or {}).items():
+        explicit_overrides = generation_config_overrides or {}
+        for attr, value in explicit_overrides.items():
             if value is None or not hasattr(request.generation_config, attr):
                 continue
             setattr(request.generation_config, attr, value)
-        request.generation_config.enable_default_thinking()
+
+        # The captured browser body usually carries a HIGH thinking config. That is
+        # inherited state, not a caller choice, so the default thinking level stays
+        # ours to size against the caller's output budget. A thinking config set by
+        # the model profile (image models use MINIMAL) or by the caller is explicit
+        # and must survive untouched.
+        thinking_is_explicit = (
+            "thinking_config" in defaults or "thinking_config" in explicit_overrides
+        )
+        request.generation_config.enable_default_thinking(
+            max_tokens, force=not thinking_is_explicit, model=model
+        )
 
         # OpenAI chat compatibility should not inherit browser-side structured output
         # or explicit reasoning settings from a previously captured AI Studio request.
         if sanitize_plain_text and not model_defaults.is_image_model:
             request.generation_config.sanitize_for_plain_text()
-            request.generation_config.enable_default_thinking()
+            request.generation_config.enable_default_thinking(
+                max_tokens, force=not thinking_is_explicit, model=model
+            )
 
         if safety_off:
             request.safety_settings = [[None, None, cat, 5] for cat in [7, 8, 9, 10]]

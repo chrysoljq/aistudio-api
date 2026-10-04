@@ -13,6 +13,8 @@ from aistudio_api.api.schemas import GeminiGenerateContentRequest
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.api_service_common import (
     MAX_RETRIES,
+    arm_block_notice,
+    arm_block_notice_from_finish,
     ensure_active_account,
     logger,
     record_rotator_event,
@@ -24,6 +26,8 @@ from aistudio_api.domain.errors import AistudioError, AuthError, RequestError, U
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
 
+# ARM patch (2026-09-24)：arm_block_notice / arm_block_notice_from_finish 已上移
+# api_service_common（Gemini 原生与 OpenAI 兼容路径共享同一翻译语义）。
 async def handle_gemini_generate_content(
     model_path: str,
     req: GeminiGenerateContentRequest,
@@ -69,12 +73,16 @@ async def handle_gemini_generate_content(
 
                 record_rotator_event("success")
                 runtime_state.record(normalized["model"], "success", output.usage)
+                # ARM patch (2026-09-24)：上游过滤时显式带出原因（见 arm_block_notice 注释）
+                arm_notice = arm_block_notice(output)
+                if arm_notice:
+                    logger.warning("[arm] %s", arm_notice)
                 return GeminiGenerateContentResponse(
                     candidates=[
                         GeminiCandidateResponse(
                             content=GeminiContentResponse(
                                 parts=to_gemini_parts(
-                                    output.text,
+                                    output.text or arm_notice,
                                     function_calls=output.function_calls,
                                     function_responses=output.function_responses,
                                     thinking=output.thinking,
@@ -82,7 +90,10 @@ async def handle_gemini_generate_content(
                                     reasoning_images=output.reasoning_images,
                                 ),
                             ),
-                            finishReason="STOP" if not output.function_calls else "FUNCTION_CALL",
+                            finishReason=(
+                                "SAFETY" if arm_notice
+                                else ("STOP" if not output.function_calls else "FUNCTION_CALL")
+                            ),
                         )
                     ],
                     usageMetadata=to_gemini_usage_metadata(output.usage),
@@ -126,6 +137,13 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
         async with busy_lock:
             try:
                 final_usage = None
+                # ARM overlay (2026-09-24, guo-issue-202609242350)：流式路径 finish
+                # 语义可见化。网关以 ("finish", {...}) 事件透传 wire finish 码；
+                # 空内容 + 非零码 → 先补一条可读原因 chunk，再以 finishReason=SAFETY
+                # 收尾（与 Gemini 协议枚举对齐，如实呈现内容决策）。仅做可见化，
+                # 不改变也不绕过上游过滤。
+                saw_content = False
+                final_finish = None
                 for stream_attempt in range(MAX_RETRIES):
                     try:
                         has_yielded_data = False
@@ -146,7 +164,10 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                             force_refresh_capture=stream_attempt > 0,
                         ):
                             has_yielded_data = True
-                            if event_type == "body" and text:
+                            if event_type == "finish":
+                                final_finish = text
+                            elif event_type == "body" and text:
+                                saw_content = True
                                 yield "data: " + json.dumps(
                                     {
                                         "candidates": [
@@ -159,6 +180,7 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                                     ensure_ascii=False,
                                 ) + "\n\n"
                             elif event_type == "images" and text:
+                                saw_content = True
                                 yield "data: " + json.dumps(
                                     {
                                         "candidates": [
@@ -177,6 +199,7 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                                     ensure_ascii=False,
                                 ) + "\n\n"
                             elif event_type == "reasoning_images" and text:
+                                saw_content = True
                                 yield "data: " + json.dumps(
                                     {
                                         "candidates": [
@@ -195,6 +218,7 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
                                     ensure_ascii=False,
                                 ) + "\n\n"
                             elif event_type == "thinking" and text:
+                                saw_content = True
                                 yield "data: " + json.dumps(
                                     {
                                         "candidates": [
@@ -234,6 +258,34 @@ def _build_gemini_streaming_response(*, client: AIStudioClient, normalized: dict
 
                 record_rotator_event("success")
                 runtime_state.record(normalized["model"], "success", final_usage)
+
+                # ARM overlay (2026-09-24)：流式收尾块——透传 finish 语义
+                arm_blocked = bool(final_finish and final_finish.get("code"))
+                if arm_blocked:
+                    arm_stream_notice = arm_block_notice_from_finish(final_finish)
+                    if arm_stream_notice:
+                        logger.warning("[arm] %s", arm_stream_notice)
+                    if arm_stream_notice and not saw_content:
+                        yield "data: " + json.dumps(
+                            {
+                                "candidates": [
+                                    {
+                                        "content": {"role": "model", "parts": [{"text": arm_stream_notice}]},
+                                        "finishReason": None,
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ) + "\n\n"
+                yield "data: " + json.dumps(
+                    {
+                        "candidates": [
+                            {"finishReason": "SAFETY" if arm_blocked else "STOP"}
+                        ]
+                    },
+                    ensure_ascii=False,
+                ) + "\n\n"
+
                 if final_usage:
                     yield "data: " + json.dumps(
                         {

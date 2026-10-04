@@ -7,6 +7,7 @@ from aistudio_api.infrastructure.gateway.wire_types import (
     AistudioThinkingConfig,
     MediaResolution,
     ThinkingLevel,
+    budget_sized_thinking_level,
 )
 
 
@@ -57,6 +58,84 @@ def test_generation_config_enables_default_thinking():
 
     assert config.thinking_config == [1, None, None, 3]
     assert config.media_resolution is None
+
+
+def test_generation_config_disables_thinking_when_output_budget_is_small():
+    # HIGH thinking consumed 93/96 tokens at max_tokens=100, leaving 2 tokens of
+    # visible content ("长城是"). Below the threshold the level drops to MINIMAL,
+    # measured 0 reasoning tokens. Omitting the config is not an option: these
+    # models reason even with no thinking config (95-96 reasoning tokens).
+    config = AistudioGenerationConfig([])
+
+    config.enable_default_thinking(100, model="models/gemini-3.5-flash")
+
+    assert config.thinking_config == [1, None, None, 4]
+    assert config.media_resolution is None
+
+
+def test_generation_config_uses_low_when_model_rejects_minimal():
+    # gemini-flash-latest answers HTTP 400 for MINIMAL; LOW is its cheapest
+    # accepted level and also measured 0 reasoning tokens.
+    config = AistudioGenerationConfig([])
+
+    config.enable_default_thinking(100, model="models/gemini-flash-latest")
+
+    assert config.thinking_config == [1, None, None, 1]
+
+
+def test_budget_sized_thinking_level_defaults_to_minimal():
+    assert budget_sized_thinking_level("models/gemini-3.5-flash") == ThinkingLevel.MINIMAL
+    assert budget_sized_thinking_level(None) == ThinkingLevel.MINIMAL
+
+
+def test_budget_sized_thinking_level_falls_back_for_unsupported_model():
+    assert budget_sized_thinking_level("models/gemini-flash-latest") == ThinkingLevel.LOW
+
+
+def test_generation_config_keeps_high_thinking_without_token_cap():
+    config = AistudioGenerationConfig([])
+
+    config.enable_default_thinking(None)
+
+    assert config.thinking_config == [1, None, None, 3]
+
+
+def test_generation_config_keeps_high_thinking_when_budget_is_generous():
+    config = AistudioGenerationConfig([])
+
+    config.enable_default_thinking(2000)
+
+    assert config.thinking_config == [1, None, None, 3]
+
+
+def test_generation_config_never_overrides_caller_thinking_config():
+    # An explicit caller/model-default choice always wins, capped or not.
+    config = AistudioGenerationConfig([])
+    config.thinking_config = AistudioThinkingConfig(ThinkingLevel.MEDIUM).to_wire()
+
+    config.enable_default_thinking(100)
+
+    assert config.thinking_config == [1, None, None, 2]
+
+
+def test_generation_config_keeps_image_model_thinking_level_under_small_cap():
+    # Image models get MINIMAL from their profile; force=True must not clear it.
+    config = AistudioGenerationConfig([])
+    config.thinking_config = AistudioThinkingConfig(ThinkingLevel.MINIMAL).to_wire()
+
+    config.enable_default_thinking(64, force=True)
+
+    assert config.thinking_config == [1, None, None, 4]
+
+
+def test_generation_config_force_resizes_inherited_high_thinking():
+    # The captured browser body carries HIGH; with a small cap it must be resized.
+    config = AistudioGenerationConfig([])
+    config.thinking_config = AistudioThinkingConfig(ThinkingLevel.HIGH).to_wire()
+
+    config.enable_default_thinking(100, force=True, model="models/gemini-3.5-flash")
+
+    assert config.thinking_config == [1, None, None, 4]
 
 
 def test_generation_config_accepts_readable_image_output_mode_wrapper():

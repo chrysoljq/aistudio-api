@@ -13,6 +13,31 @@ class ThinkingLevel(IntEnum):
     MINIMAL = 4
 
 
+# Reasoning at the default HIGH level consumes 92-96% of a small output budget
+# (measured on gemini-3.5-flash: 94/96, 615/641, 736/776 tokens), leaving 0-2
+# tokens of visible content. Below this cap the default is downgraded to MINIMAL,
+# which measured 0 reasoning tokens and left the whole budget for content.
+THINKING_BUDGET_STARVATION_THRESHOLD = 1024
+
+# Measured model capabilities (ARM, guo-issue-202610011935):
+#   MINIMAL -> 0 reasoning tokens: gemini-3.5-flash, gemini-3-flash-preview,
+#             gemini-3.1-flash-lite, gemini-flash-lite-latest
+#   MINIMAL -> HTTP 400 "Thinking level MINIMAL is not supported for this
+#             model": gemini-flash-latest, whose cheapest accepted level is LOW
+#             (also measured 0 reasoning tokens)
+#   LOW is NOT a safe universal fallback: it still spent 93-96 reasoning tokens
+#   on gemini-3.5-flash and gemini-3.1-flash-lite.
+THINKING_LEVEL_UNSUPPORTED_MINIMAL = ("gemini-flash-latest",)
+
+
+def budget_sized_thinking_level(model: str | None = None) -> ThinkingLevel:
+    """Cheapest thinking level that still yields 0 reasoning tokens for `model`."""
+    name = str(model or "").rsplit("/", 1)[-1].strip().lower()
+    if any(token in name for token in THINKING_LEVEL_UNSUPPORTED_MINIMAL):
+        return ThinkingLevel.LOW
+    return ThinkingLevel.MINIMAL
+
+
 class MediaResolution(IntEnum):
     LOW = 1
     MEDIUM = 2
@@ -202,9 +227,33 @@ class AistudioGenerationConfig:
         if len(self.values) > 16:
             self.values[16] = None
 
-    def enable_default_thinking(self):
-        if self.thinking_config is None:
-            self.thinking_config = AistudioThinkingConfig.default().to_wire()
+    def enable_default_thinking(
+        self,
+        max_tokens: int | None = None,
+        *,
+        force: bool = False,
+        model: str | None = None,
+    ):
+        """Apply the gateway's default thinking level, sized to the output budget.
+
+        Thinking draws from the same budget as visible content: at the default
+        HIGH level it consumes 92-96% of a small cap and leaves 0-2 tokens of
+        visible content ("长城是" at max_tokens=100). A level must be sent either
+        way -- these models reason even with no thinking config at all (measured
+        95-96 reasoning tokens), so dropping the config does not disable thinking.
+        Below the starvation threshold the default drops to MINIMAL instead, which
+        measured 0 reasoning tokens and full content.
+
+        `force` replaces a thinking config that is merely inherited from the
+        captured browser request. A config the caller or the model profile set on
+        purpose is never overridden.
+        """
+        if self.thinking_config is not None and not force:
+            return
+        level = ThinkingLevel.HIGH
+        if max_tokens is not None and max_tokens < THINKING_BUDGET_STARVATION_THRESHOLD:
+            level = budget_sized_thinking_level(model)
+        self.thinking_config = AistudioThinkingConfig(level=level).to_wire()
 
     def sanitize_for_plain_text(self):
         self.response_mime_type = "text/plain"

@@ -29,8 +29,19 @@ def test_modify_body_updates_generation_config_and_prompt():
     assert body[3][4] == 0.2
     assert body[3][5] == 0.9
     assert body[3][6] == 32
-    assert body[3][16] == [1, None, None, 3]
+    # 256 tokens is below the starvation threshold, so thinking drops to MINIMAL.
+    # HIGH here would have spent ~93/96 tokens on reasoning and left the caller
+    # ~2 tokens of visible content (guo-issue-202610011935).
+    assert body[3][16] == [1, None, None, 4]
     assert len(body[3]) <= 17 or body[3][17] is None
+
+
+def test_modify_body_keeps_high_thinking_when_budget_is_generous():
+    original = '["models/original",[[[[null,"old"]],"user"]],null,[null,null,null,128,0.5,0.8,16],"!snap",null,null]'
+    rewritten = modify_body(original, model="models/new", prompt="p", max_tokens=4096)
+
+    body = json.loads(rewritten)
+    assert body[3][16] == [1, None, None, 3]
 
 
 def test_build_image_generation_search_tool_variants():
